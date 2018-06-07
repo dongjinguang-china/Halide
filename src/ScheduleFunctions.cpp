@@ -14,6 +14,7 @@
 #include "Substitute.h"
 #include "Target.h"
 #include "Var.h"
+#include "CopyElision.h"
 
 #include <algorithm>
 
@@ -70,6 +71,18 @@ bool contains_impure_call(const Expr &expr) {
     return is_not_pure.result;
 }
 
+class CurrentRealizationInScope : public IRVisitor {
+    using IRVisitor::visit;
+
+    void visit(const Realize *op) {
+        funcs.insert(op->name);
+    }
+
+public:
+    set<string> funcs;
+    CurrentRealizationInScope() {}
+};
+
 // Build a loop nest about a provide node using a schedule
 Stmt build_provide_loop_nest_helper(string func_name,
                                     string prefix,
@@ -85,6 +98,7 @@ Stmt build_provide_loop_nest_helper(string func_name,
     // then wrapping it in for loops.
 
     // Make the (multi-dimensional multi-valued) store node.
+    // TODO(psuriana): How should we check if the substitution is indeed okay?
     Stmt stmt = Provide::make(func_name, values, site);
 
     // A map of the dimensions for which we know the extent is a
@@ -784,11 +798,14 @@ public:
     bool is_output, found_store_level, found_compute_level;
     const Target &target;
     const map<string, Function> &env;
+    const vector<CopyPair> &pointwise_copies;
 
     InjectRealization(const Function &f, bool o, const Target &t,
-                      const map<string, Function> &env)
+                      const map<string, Function> &env,
+                      const vector<CopyPair> &pointwise_copies)
         : func(f), is_output(o), found_store_level(false),
-          found_compute_level(false), target(t), env(env) {}
+          found_compute_level(false), target(t), env(env),
+          pointwise_copies(pointwise_copies) {}
 
 private:
     // Determine if 'loop_name' is the right level to inject produce/realize node
@@ -1186,13 +1203,16 @@ public:
     bool found_store_level, found_compute_level;
     const Target &target;
     const map<string, Function> &env;
+    const vector<CopyPair> &pointwise_copies;
     LoopLevel compute_level;
     LoopLevel store_level;
 
     InjectGroupRealization(const vector<Function> &g, const vector<bool> &o,
-                           const Target &t, const map<string, Function> &env)
+                           const Target &t, const map<string, Function> &env,
+                           const vector<CopyPair> &pointwise_copies)
             : group(g), is_output_list(o), found_store_level(false),
-              found_compute_level(false), target(t), env(env) {
+              found_compute_level(false), target(t), env(env),
+              pointwise_copies(pointwise_copies) {
         internal_assert(!group.empty());
         internal_assert(group.size() == is_output_list.size());
 
@@ -2202,6 +2222,15 @@ Stmt schedule_functions(const vector<Function> &outputs,
 
     validate_fused_groups_schedule(fused_groups, env);
 
+    vector<CopyPair> pointwise_copies = get_pointwise_copies(env);
+    debug(0) << "\nPointwise copies:\n";
+    for (const auto &p : pointwise_copies) {
+        debug(0) << "prod: " << p.prod << " -> cons: " << p.cons << "\n";
+        debug(0) << "\t\tcons: " << print_function(env.at(p.cons)) << "\n";
+        debug(0) << "\t\tprod: " << print_function(env.at(p.prod)) << "\n\n";
+    }
+    debug(0) << "\n";
+
     for (size_t i = fused_groups.size(); i > 0; --i) {
         const vector<string> &group = fused_groups[i-1];
         vector<Function> funcs;
@@ -2243,12 +2272,12 @@ Stmt schedule_functions(const vector<Function> &outputs,
                 s = inline_function(s, funcs[0]);
             } else {
                 debug(1) << "Injecting realization of " << funcs[0].name() << '\n';
-                InjectRealization injector(funcs[0], is_output_list[0], target, env);
+                InjectRealization injector(funcs[0], is_output_list[0], target, env, pointwise_copies);
                 s = injector.mutate(s);
                 internal_assert(injector.found_store_level && injector.found_compute_level);
             }
         } else {
-            InjectGroupRealization injector(funcs, is_output_list, target, env);
+            InjectGroupRealization injector(funcs, is_output_list, target, env, pointwise_copies);
             s = injector.mutate(s);
             internal_assert(injector.found_store_level && injector.found_compute_level);
         }
